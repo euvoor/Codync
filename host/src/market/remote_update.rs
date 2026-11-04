@@ -25,20 +25,64 @@ pub async fn update_connector(store: &crate::store::Store, id: &str, b: &Value, 
         }
         return connector_update::update_custom_connector(store, id, b, port).await;
     }
-    let (connector, connection_changed) = save_remote(store, &before, b).await?;
-    let check = if connection_changed {
-        Some(super::verify::verify(store, id, port).await.map_err(|e| EditFailure::WontStart.error(e))?)
+    let (saved, needs_check) = save_remote(store, &before, b).await?;
+    if needs_check {
+        checked_remote(store, &saved, super::verify::verify(store, id, port)).await
     } else {
-        None
+        Ok(serde_json::json!({"connector": saved.public(), "verify": null}))
+    }
+}
+
+/// The check resolves its target by ID. Fence its result with the saved definition so
+/// another edit cannot supply the readiness result reported for this one.
+async fn checked_remote(
+    store: &crate::store::Store,
+    saved: &Connector,
+    check: impl std::future::Future<Output = Result<Value>>,
+) -> Result<Value> {
+    current_connection(store, saved)?;
+    let check = check.await;
+    let current = current_connection(store, saved)?;
+    let check = check.map_err(|e| connector_update::EditFailure::WontStart.error(e))?;
+    Ok(serde_json::json!({"connector": current.public(), "verify": check}))
+}
+
+fn current_connection(store: &crate::store::Store, saved: &Connector) -> Result<Connector> {
+    let conflict = || {
+        connector_update::EditFailure::Conflict
+            .error("The connector changed while it was being checked. Read it again and retry.")
     };
-    Ok(serde_json::json!({"connector": connector, "verify": check}))
+    let current = connectors(store)?.into_iter().find(|c| c.id == saved.id).ok_or_else(conflict)?;
+    // Refreshing a grant may rotate tokens and expiry; a different registration or sign-out
+    // is not that refresh. Every other saved field, including the revision, must still match.
+    let mut expected = saved.clone();
+    expected.oauth = current.oauth.clone();
+    if current != expected || !same_sign_in(saved.oauth.as_ref(), current.oauth.as_ref()) {
+        return Err(conflict());
+    }
+    Ok(current)
+}
+
+fn same_sign_in(a: Option<&oauth::OAuth>, b: Option<&oauth::OAuth>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            a.client_id == b.client_id
+                && a.client_secret == b.client_secret
+                && a.redirect_uris == b.redirect_uris
+                && a.token_endpoint == b.token_endpoint
+                && a.signed_in() == b.signed_in()
+        }
+        _ => false,
+    }
 }
 
 /// Prepare outside the lock, then save only if no other writer changed the definition.
-async fn save_remote(store: &crate::store::Store, before: &Connector, b: &Value) -> Result<(Value, bool)> {
+async fn save_remote(store: &crate::store::Store, before: &Connector, b: &Value) -> Result<(Connector, bool)> {
     use connector_update::EditFailure;
     let mut edited = prepare(before, b).map_err(|e| EditFailure::Invalid.error(e))?;
-    let connection_changed = edited.url != before.url || edited.headers != before.headers;
+    // Repeating a URL/header edit after sign-in is also a request to check and refresh.
+    let needs_check = b.get("url").is_some() || b.get("headers").is_some();
     if edited.url != before.url {
         let mut headers = BTreeMap::new();
         for (key, value) in &edited.headers {
@@ -58,9 +102,9 @@ async fn save_remote(store: &crate::store::Store, before: &Connector, b: &Value)
             return Err(EditFailure::Conflict.error("The connector changed during this edit. Read it again and retry."));
         }
         *current = edited;
-        Ok(current.public())
+        Ok(current.clone())
     })?;
-    Ok((connector, connection_changed))
+    Ok((connector, needs_check))
 }
 
 fn prepare(before: &Connector, b: &Value) -> Result<Connector> {
@@ -85,10 +129,12 @@ fn prepare(before: &Connector, b: &Value) -> Result<Connector> {
         }
         edited.headers.clear();
         edited.oauth = None;
-        edited.auth_revision = uuid::Uuid::new_v4().to_string();
     }
     if let Some(headers) = b.get("headers") {
         merge_headers(&mut edited, headers)?;
+    }
+    if edited.url != before.url || edited.headers != before.headers {
+        edited.auth_revision = uuid::Uuid::new_v4().to_string();
     }
     Ok(edited)
 }

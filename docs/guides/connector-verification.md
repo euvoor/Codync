@@ -36,10 +36,16 @@ replacement credentials. A fresh tool process uses the edited endpoint. HTTPS is
 URLs with user information or fragments and invalid headers are refused.
 
 Discovery never overwrites a concurrent edit or credential refresh: the caller
-must reread and retry. Remote URL or header changes are saved before
+must reread and retry. Verification checks the saved definition before and after
+the handshake; another edit cannot supply its readiness result. Token refreshes
+may advance the same grant, but sign-out or a new registration invalidates the check.
+URL or header changes advance the revision, including when values are later restored. Remote URL or header changes are saved before
 verification so OAuth can use the new endpoint. A failed check leaves them saved
 without refreshing bots; local runtime edits instead check before saving.
-Changing only a name or description performs no check and returns `verify: null`. Registry
+Changing only a name or description performs no check and returns `verify: null`.
+Explicit `url` or `headers` requests verification even when unchanged. After
+sign-in, repeat `updateConnector` with the current URL to verify and refresh bots
+without resending credential values. Registry
 connectors are still managed through reinstall, pending the registry-input work.
 
 ## Recorded result: 2026-10-05, macOS

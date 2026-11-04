@@ -78,8 +78,13 @@ that can't be told is logged and doesn't fail the saved edit (`host/src/market/c
 Custom URL connectors use the same loopback-only method with `url` and `headers`.
 Remote connection changes are saved before verification, allowing sign-in against
 the new endpoint; failed verification leaves the edit saved and refreshes no bots.
-Metadata-only edits need no check. URL changes require explicit replacement headers,
-clear the old OAuth grant, and invalidate pending sign-ins and running proxies.
+Metadata-only edits need no check. Explicit URL/header retries verify even when
+unchanged, so repeating the current URL after sign-in refreshes affected bots.
+The saved connection is checked before and after verification; token refreshes may
+advance the same grant, but intervening edits cannot supply its readiness result.
+URL changes require explicit replacement headers,
+and clear the old OAuth grant. URL or header changes advance the revision and
+invalidate pending sign-ins and running proxies.
 See [remote edit details](../guides/connector-verification.md#editing-a-custom-remote-connector).
 Registry connectors are still refused.
 

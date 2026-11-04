@@ -8,7 +8,7 @@ async fn save_edit(store: &Store, b: &Value) -> Result<Value> {
     let id = b["id"].as_str().unwrap().trim();
     let before = connectors(store)?.into_iter().find(|c| c.id == id).unwrap();
     let (connector, _) = save_remote(store, &before, b).await?;
-    Ok(connector)
+    Ok(connector.public())
 }
 
 #[tokio::test]
@@ -66,7 +66,7 @@ async fn remote_metadata_and_headers_preserve_identity_and_sign_in() {
     assert_eq!(updated.id, original.id);
     assert_eq!(updated.url, original.url);
     assert_eq!(updated.oauth, original.oauth);
-    assert_eq!(updated.auth_revision, original.auth_revision);
+    assert_ne!(updated.auth_revision, original.auth_revision, "changed headers invalidate stale checks and proxies");
     assert_eq!(updated.description, original.description);
     assert_eq!(
         updated.headers,
@@ -263,4 +263,105 @@ async fn transport_fields_and_registry_definitions_cannot_be_changed_through_the
         assert!(update_connector(&store, &c.id, &patch, 0).await.unwrap_err().to_string().contains("local connector"));
         assert_eq!(connectors(&store).unwrap().as_slice(), std::slice::from_ref(&c));
     }
+}
+
+#[tokio::test]
+async fn verification_cannot_report_ready_for_a_concurrent_replacement() {
+    for before_check in [true, false] {
+        let (store, original) = fixture();
+        let (saved, _) = save_remote(&store, &original, &json!({"headers":{"X-Mode":"first"}})).await.unwrap();
+        let replacement = prepare(&saved, &json!({"headers":{"X-Mode":"second"}})).unwrap();
+        if before_check {
+            save_connectors(&store, std::slice::from_ref(&replacement)).unwrap();
+        }
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let result = checked_remote(&store, &saved, async {
+            ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            save_connectors(&store, std::slice::from_ref(&replacement)).unwrap();
+            Ok(json!({"status":"ready","toolCount":3}))
+        })
+        .await;
+        let error = result.unwrap_err();
+        assert_eq!(error.downcast_ref::<connector_update::EditFailed>().unwrap().category(), "conflict");
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), !before_check);
+        assert_eq!(connectors(&store).unwrap(), [replacement]);
+    }
+}
+
+#[tokio::test]
+async fn returning_to_previous_headers_cannot_revive_an_old_readiness_check() {
+    let (store, original) = fixture();
+    let result = checked_remote(&store, &original, async {
+        let (changed, _) = save_remote(&store, &original, &json!({"headers":{"X-Mode":"write"}})).await.unwrap();
+        let (returned, _) = save_remote(&store, &changed, &json!({"headers":{"X-Mode":"read"}})).await.unwrap();
+        assert_eq!(returned.headers, original.headers);
+        assert_eq!(returned.oauth, original.oauth);
+        assert_ne!(returned.auth_revision, original.auth_revision);
+        Ok(json!({"status":"ready"}))
+    })
+    .await;
+    assert_eq!(result.unwrap_err().downcast_ref::<connector_update::EditFailed>().unwrap().category(), "conflict");
+}
+
+#[tokio::test]
+async fn readiness_allows_token_refresh_but_rejects_sign_out_or_a_new_registration() {
+    for change in ["refresh", "sign-out", "registration"] {
+        let (store, original) = fixture();
+        let result = checked_remote(&store, &original, async {
+            update_connectors(&store, |all| {
+                let oauth = all[0].oauth.as_mut().unwrap();
+                match change {
+                    "refresh" => {
+                        oauth.access_token = "rotated-private-token".into();
+                        oauth.refresh_token = Some("rotated-private-refresh".into());
+                        oauth.expires_at = Some(9999999999);
+                    }
+                    "sign-out" => oauth.access_token.clear(),
+                    _ => oauth.client_id = "different-client".into(),
+                }
+                Ok(())
+            })
+            .unwrap();
+            Ok(json!({"status":"ready"}))
+        })
+        .await;
+        if change == "refresh" {
+            let reply = result.unwrap();
+            assert_eq!(reply["verify"]["status"], "ready");
+            assert!(!reply.to_string().contains("private"));
+        } else {
+            assert_eq!(
+                result.unwrap_err().downcast_ref::<connector_update::EditFailed>().unwrap().category(),
+                "conflict"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn retrying_a_saved_url_after_sign_in_requests_readiness_and_refresh() {
+    let (store, mut old) = fixture();
+    old.oauth = Some(oauth::OAuth::default());
+    save_connectors(&store, std::slice::from_ref(&old)).unwrap();
+    // The first edit stays saved when sign-in is missing.
+    let edit = json!({"headers":{"X-New":"private"}});
+    assert!(update_connector(&store, &old.id, &edit, 0).await.unwrap_err().to_string().contains("Sign in"));
+    // An unchanged URL must recheck, not silently return verify:null.
+    let retry = json!({"url":old.url});
+    assert!(update_connector(&store, &old.id, &retry, 0).await.unwrap_err().to_string().contains("Sign in"));
+    update_connectors(&store, |all| {
+        all[0].oauth.as_mut().unwrap().access_token = "signed-in-private".into();
+        Ok(())
+    })
+    .unwrap();
+    let current = connectors(&store).unwrap().remove(0);
+    let (saved, needs_check) = save_remote(&store, &current, &retry).await.unwrap();
+    assert!(needs_check, "the retry must reach verification and the API's refresh path");
+    assert_eq!(saved.headers["X-New"], "private", "retry needs no credential replay");
+    assert_eq!(saved.auth_revision, current.auth_revision, "retry doesn't invalidate the new grant");
+    // Scripted readiness isolates recovery from real-provider OAuth and the OS keychain.
+    let reply = checked_remote(&store, &saved, async { Ok(json!({"status":"ready"})) }).await.unwrap();
+    assert_eq!(reply["verify"]["status"], "ready", "a non-null result permits the existing bot refresh path");
+    let (_, metadata_check) = save_remote(&store, &saved, &json!({"description":"metadata"})).await.unwrap();
+    assert!(!metadata_check, "metadata alone must not restart bots");
 }

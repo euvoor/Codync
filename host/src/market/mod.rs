@@ -90,7 +90,7 @@ pub struct Connector {
     /// Remote servers that want sign-in; see `oauth`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<oauth::OAuth>,
-    /// Changes when a remote endpoint is edited, invalidating in-flight sign-ins.
+    /// Changes when a remote URL or headers are edited, invalidating in-flight sign-ins.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub auth_revision: String,
 }

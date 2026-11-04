@@ -63,7 +63,9 @@ apps) keeps its id and each bot's choice. Omitted fields stay; `command` is an
 executable path, never split into arguments; `args` replaces the list and `args: []`
 clears it; `env` merges, with `null` removing a key. The readiness check runs on the
 edited copy and the edit is saved only if it passes, so a typo can't break a working
-connector and an error always means nothing changed. Bots that have the connector on
+connector. If the same connector changes during that check, the edit is refused without
+writing; read its current settings and retry. This also applies to name or description
+changes. Edits to other connectors do not conflict. Bots that have the connector on
 then rebuild their tools for their next turn. Registry and remote connectors are
 refused (`host/src/market/connector_update.rs`).
 

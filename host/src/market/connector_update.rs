@@ -7,23 +7,31 @@ use serde_json::{Value, json};
 
 /// Edits an installed local connector: omitted fields keep their value, `args` replaces the
 /// argument list, and `env` merges, with `null` removing a key. The edit is saved only once the
-/// edited connector starts, so an error always means the connector is as it was.
+/// edited connector starts. A failed edit writes nothing, including when another edit wins
+/// while verification is running.
 ///
 /// Registry installs rebuild their command line from the registry, and a remote connector's
 /// URL and OAuth handling are the registry's or the user's to redo, so those are refused here.
 pub async fn update_custom_connector(store: &crate::store::Store, b: &Value, port: u16) -> Result<Value> {
     let id = b["id"].as_str().map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| anyhow!("`id` is required"))?;
-    let mut edited = connectors(store)?.into_iter().find(|c| c.id == id).ok_or_else(|| anyhow!("Unknown connector"))?;
+    let before = connectors(store)?.into_iter().find(|c| c.id == id).ok_or_else(|| anyhow!("Unknown connector"))?;
+    let mut edited = before.clone();
     apply(&mut edited, b)?;
     let check = verify::check_connector(store, &edited, port).await?;
-    // The check can take a minute, so the edit goes onto what's saved by then, not onto the copy.
+    // Verification runs without the lock; only save the exact definition we checked.
     let connector = update_connectors(store, |all| {
         let c = all.iter_mut().find(|c| c.id == id).ok_or_else(|| anyhow!("Unknown connector"))?;
-        apply(c, b)?;
+        if c != &before {
+            bail!("The connector changed during verification. Read it again and retry.");
+        }
+        *c = edited;
         Ok(c.public())
     })?;
     Ok(json!({"connector": connector, "verify": check}))
 }
+
+#[cfg(test)]
+mod concurrency_tests;
 
 /// Applies an edit, reading every field before writing any, so one bad value changes nothing.
 fn apply(c: &mut Connector, b: &Value) -> Result<()> {

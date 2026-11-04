@@ -52,6 +52,10 @@ In the **Connectors** section, choose **Custom connector**, above the registry l
 
 Everything you enter is saved on that computer only.
 
+When editing a custom command connector through the local `updateConnector` API,
+an edit is refused if that connector changes while its connection check runs.
+The other change stays saved. Read the current settings before retrying.
+
 ## Apps through Composio
 
 Composio is in the featured connectors. Add it and sign in to your Composio account; no API key is needed. Your bots can then find and connect apps through Composio's own tools.

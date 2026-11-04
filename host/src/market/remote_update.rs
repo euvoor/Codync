@@ -5,19 +5,40 @@ use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-pub async fn update_connector(store: &crate::store::Store, b: &Value) -> Result<Value> {
-    let id = connector_update::text(b, "id")?.filter(|s| !s.is_empty()).ok_or_else(|| anyhow!("`id` is required"))?;
-    let before = connectors(store)?.into_iter().find(|c| c.id == id).ok_or_else(|| anyhow!("Unknown connector"))?;
+/// Local edits keep their check-before-save contract. Remote connection edits must be
+/// saved first so OAuth and the proxy can address the new endpoint by its existing ID.
+pub async fn update_connector(store: &crate::store::Store, id: &str, b: &Value, port: u16) -> Result<Value> {
+    use connector_update::EditFailure;
+    let before = connectors(store)?
+        .into_iter()
+        .find(|c| c.id == id)
+        .ok_or_else(|| EditFailure::Invalid.error("Unknown connector"))?;
     if before.registry_name.is_some() {
-        bail!("This connector came from the MCP registry; use its setup inputs when reinstalling");
+        return Err(EditFailure::Refused
+            .error("This connector came from the MCP registry; use its setup inputs when reinstalling"));
     }
     if before.command.is_some() {
         if b.get("url").is_some() || b.get("headers").is_some() {
-            bail!("A local connector accepts command, args and env, not URL or headers");
+            return Err(
+                EditFailure::Invalid.error("A local connector accepts command, args and env, not URL or headers")
+            );
         }
-        return connector_update::update_custom_connector(store, b);
+        return connector_update::update_custom_connector(store, id, b, port).await;
     }
-    let mut edited = prepare(&before, b)?;
+    let (connector, connection_changed) = save_remote(store, &before, b).await?;
+    let check = if connection_changed {
+        Some(super::verify::verify(store, id, port).await.map_err(|e| EditFailure::WontStart.error(e))?)
+    } else {
+        None
+    };
+    Ok(serde_json::json!({"connector": connector, "verify": check}))
+}
+
+/// Prepare outside the lock, then save only if no other writer changed the definition.
+async fn save_remote(store: &crate::store::Store, before: &Connector, b: &Value) -> Result<(Value, bool)> {
+    use connector_update::EditFailure;
+    let mut edited = prepare(before, b).map_err(|e| EditFailure::Invalid.error(e))?;
+    let connection_changed = edited.url != before.url || edited.headers != before.headers;
     if edited.url != before.url {
         let mut headers = BTreeMap::new();
         for (key, value) in &edited.headers {
@@ -27,15 +48,19 @@ pub async fn update_connector(store: &crate::store::Store, b: &Value) -> Result<
             edited.oauth = Some(oauth::OAuth::default());
         }
     }
-    update_connectors(store, |all| {
-        let current = all.iter_mut().find(|c| c.id == id).ok_or_else(|| anyhow!("Unknown connector"))?;
+    let connector = update_connectors(store, |all| {
+        let current = all
+            .iter_mut()
+            .find(|c| c.id == before.id)
+            .ok_or_else(|| EditFailure::Conflict.error("Unknown connector"))?;
         // Discovery can take time. Never overwrite a concurrent credential refresh or edit.
-        if current != &before {
-            bail!("The connector changed during this edit. Read it again and retry.");
+        if current != before {
+            return Err(EditFailure::Conflict.error("The connector changed during this edit. Read it again and retry."));
         }
         *current = edited;
         Ok(current.public())
-    })
+    })?;
+    Ok((connector, connection_changed))
 }
 
 fn prepare(before: &Connector, b: &Value) -> Result<Connector> {
@@ -96,7 +121,7 @@ fn merge_headers(c: &mut Connector, value: &Value) -> Result<()> {
         }
         let replacement = match value {
             Value::Null => None,
-            Value::String(s) if s.len() <= 64 * 1024 => {
+            Value::String(s) if s.len() <= super::MAX_CREDENTIAL_BYTES => {
                 reqwest::header::HeaderValue::from_str(s).map_err(|_| anyhow!("Invalid header value"))?;
                 Some(s.clone())
             }

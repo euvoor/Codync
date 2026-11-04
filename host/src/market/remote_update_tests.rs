@@ -4,6 +4,42 @@ use crate::store::Store;
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 
+async fn save_edit(store: &Store, b: &Value) -> Result<Value> {
+    let id = b["id"].as_str().unwrap().trim();
+    let before = connectors(store)?.into_iter().find(|c| c.id == id).unwrap();
+    let (connector, _) = save_remote(store, &before, b).await?;
+    Ok(connector)
+}
+
+#[tokio::test]
+async fn remote_metadata_changes_do_not_attempt_a_handshake() {
+    let (store, mut old) = fixture();
+    old.oauth = Some(oauth::OAuth::default());
+    save_connectors(&store, std::slice::from_ref(&old)).unwrap();
+    let reply = update_connector(&store, "remote", &json!({"name":"Renamed","description":"new"}), 0).await.unwrap();
+    assert!(reply["verify"].is_null());
+    assert_eq!(reply["connector"]["name"], "Renamed");
+    let saved = connectors(&store).unwrap().remove(0);
+    assert_eq!(saved.url, old.url);
+    assert_eq!(saved.headers, old.headers);
+    assert_eq!(saved.oauth, old.oauth);
+    assert_eq!(saved.auth_revision, old.auth_revision);
+}
+
+#[tokio::test]
+async fn local_edits_still_check_before_saving_through_the_shared_entry_point() {
+    let (store, mut old) = fixture();
+    old.command = Some("python3".into());
+    old.url = None;
+    old.oauth = None;
+    save_connectors(&store, std::slice::from_ref(&old)).unwrap();
+    let error = update_connector(&store, "remote", &json!({"command":"/nonexistent/codync-edit-fixture"}), 0)
+        .await
+        .unwrap_err();
+    assert_eq!(error.downcast_ref::<connector_update::EditFailed>().unwrap().category(), "wont_start");
+    assert_eq!(connectors(&store).unwrap(), [old]);
+}
+
 fn fixture() -> (Store, Connector) {
     let store = Store::open(std::path::Path::new(":memory:")).unwrap();
     let c: Connector = serde_json::from_value(json!({
@@ -19,7 +55,7 @@ fn fixture() -> (Store, Connector) {
 #[tokio::test]
 async fn remote_metadata_and_headers_preserve_identity_and_sign_in() {
     let (store, original) = fixture();
-    let public = update_connector(
+    let public = save_edit(
         &store,
         &json!({"id":" remote ","name":"Renamed",
         "headers":{"x-api-key":"rotated", "X-Mode":null, "X-New":"new"}}),
@@ -70,7 +106,7 @@ async fn invalid_remote_edits_leave_encrypted_storage_unchanged() {
         let mut request = patch.clone();
         request["id"] = json!("remote");
         request["description"] = request.get("description").cloned().unwrap_or(json!("must not save"));
-        assert!(update_connector(&store, &request).await.is_err(), "accepted {patch}");
+        assert!(save_edit(&store, &request).await.is_err(), "accepted {patch}");
         assert_eq!(connectors(&store).unwrap().as_slice(), std::slice::from_ref(&original));
         assert_eq!(store.kv_get("connectors"), ciphertext);
     }
@@ -113,8 +149,7 @@ async fn replacement_endpoint_receives_only_explicit_headers_and_requires_new_si
     let url = format!("http://{}/mcp", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let (store, old) = fixture();
-    let public =
-        update_connector(&store, &json!({"id":old.id,"url":url,"headers":{"X-New":"explicit"}})).await.unwrap();
+    let public = save_edit(&store, &json!({"id":old.id,"url":url,"headers":{"X-New":"explicit"}})).await.unwrap();
     let c = connectors(&store).unwrap().remove(0);
     assert_eq!(c.oauth, Some(oauth::OAuth::default()));
     assert_eq!(public["auth"], "signedOut");
@@ -151,7 +186,7 @@ async fn discovery_does_not_overwrite_a_concurrent_edit() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/mcp", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let error = update_connector(&store, &json!({"id":old.id,"url":url,"headers":{}})).await.unwrap_err();
+    let error = save_edit(&store, &json!({"id":old.id,"url":url,"headers":{}})).await.unwrap_err();
     assert!(error.to_string().contains("changed during"));
     let current = connectors(&store).unwrap().remove(0);
     assert_eq!(current.description, "concurrent");
@@ -213,7 +248,7 @@ async fn transport_fields_and_registry_definitions_cannot_be_changed_through_the
     c.registry_name = Some("test/remote".into());
     save_connectors(&store, std::slice::from_ref(&c)).unwrap();
     assert!(
-        update_connector(&store, &json!({"id":c.id,"headers":{"X-New":"value"}}))
+        update_connector(&store, &c.id, &json!({"headers":{"X-New":"value"}}), 0)
             .await
             .unwrap_err()
             .to_string()
@@ -225,7 +260,7 @@ async fn transport_fields_and_registry_definitions_cannot_be_changed_through_the
     c.oauth = None;
     save_connectors(&store, std::slice::from_ref(&c)).unwrap();
     for patch in [json!({"id":c.id,"url":"https://new.example/mcp"}), json!({"id":c.id,"headers":{}})] {
-        assert!(update_connector(&store, &patch).await.unwrap_err().to_string().contains("local connector"));
+        assert!(update_connector(&store, &c.id, &patch, 0).await.unwrap_err().to_string().contains("local connector"));
         assert_eq!(connectors(&store).unwrap().as_slice(), std::slice::from_ref(&c));
     }
 }
